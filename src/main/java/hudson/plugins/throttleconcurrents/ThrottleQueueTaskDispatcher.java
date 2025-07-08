@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -50,6 +51,13 @@ public class ThrottleQueueTaskDispatcher extends QueueTaskDispatcher {
     @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "deliberately mutable")
     public static boolean USE_FLOW_EXECUTION_LIST = Boolean.parseBoolean(
             System.getProperty(ThrottleQueueTaskDispatcher.class.getName() + ".USE_FLOW_EXECUTION_LIST", "true"));
+
+    /**
+     * Map of category names to synchronization objects for category-level locking.
+     * This prevents race conditions when multiple jobs are scheduled simultaneously
+     * for the same throttle category.
+     */
+    private static final ConcurrentHashMap<String, Object> categoryLocks = new ConcurrentHashMap<>();
 
     @Deprecated
     @Override
@@ -108,44 +116,48 @@ public class ThrottleQueueTaskDispatcher extends QueueTaskDispatcher {
             for (String catNm : categories) {
                 // Quick check that catNm itself is a real string.
                 if (catNm != null && !catNm.equals("")) {
-                    List<Task> categoryTasks = ThrottleJobProperty.getCategoryTasks(catNm);
+                    // Synchronize on the category to prevent race conditions when multiple jobs
+                    // are scheduled simultaneously for the same throttle category
+                    synchronized (getCategoryLock(catNm)) {
+                        List<Task> categoryTasks = ThrottleJobProperty.getCategoryTasks(catNm);
 
-                    ThrottleJobProperty.ThrottleCategory category =
-                            ThrottleJobProperty.fetchDescriptor().getCategoryByName(catNm);
+                        ThrottleJobProperty.ThrottleCategory category =
+                                ThrottleJobProperty.fetchDescriptor().getCategoryByName(catNm);
 
-                    // Double check category itself isn't null
-                    if (category != null) {
-                        int runCount = 0;
-                        // Max concurrent per node for category
-                        int maxConcurrentPerNode = getMaxConcurrentPerNodeBasedOnMatchingLabels(
-                                node, category, category.getMaxConcurrentPerNode());
-                        if (maxConcurrentPerNode > 0) {
-                            for (Task catTask : categoryTasks) {
-                                if (jenkins.getQueue().isPending(catTask)) {
-                                    return CauseOfBlockage.fromMessage(
-                                            Messages._ThrottleQueueTaskDispatcher_BuildPending());
+                        // Double check category itself isn't null
+                        if (category != null) {
+                            int runCount = 0;
+                            // Max concurrent per node for category
+                            int maxConcurrentPerNode = getMaxConcurrentPerNodeBasedOnMatchingLabels(
+                                    node, category, category.getMaxConcurrentPerNode());
+                            if (maxConcurrentPerNode > 0) {
+                                for (Task catTask : categoryTasks) {
+                                    if (jenkins.getQueue().isPending(catTask)) {
+                                        return CauseOfBlockage.fromMessage(
+                                                Messages._ThrottleQueueTaskDispatcher_BuildPending());
+                                    }
+                                    runCount += buildsOfProjectOnNode(node, catTask);
                                 }
-                                runCount += buildsOfProjectOnNode(node, catTask);
-                            }
-                            Map<String, List<FlowNode>> throttledPipelines =
-                                    ThrottleJobProperty.getThrottledPipelineRunsForCategory(catNm);
-                            for (Map.Entry<String, List<FlowNode>> entry : throttledPipelines.entrySet()) {
-                                if (hasPendingPipelineForCategory(entry.getValue())) {
-                                    return CauseOfBlockage.fromMessage(
-                                            Messages._ThrottleQueueTaskDispatcher_BuildPending());
-                                }
-                                Run<?, ?> r = Run.fromExternalizableId(entry.getKey());
-                                if (r != null) {
-                                    List<FlowNode> flowNodes = entry.getValue();
-                                    if (r.isBuilding()) {
-                                        runCount += pipelinesOnNode(node, r, flowNodes);
+                                Map<String, List<FlowNode>> throttledPipelines =
+                                        ThrottleJobProperty.getThrottledPipelineRunsForCategory(catNm);
+                                for (Map.Entry<String, List<FlowNode>> entry : throttledPipelines.entrySet()) {
+                                    if (hasPendingPipelineForCategory(entry.getValue())) {
+                                        return CauseOfBlockage.fromMessage(
+                                                Messages._ThrottleQueueTaskDispatcher_BuildPending());
+                                    }
+                                    Run<?, ?> r = Run.fromExternalizableId(entry.getKey());
+                                    if (r != null) {
+                                        List<FlowNode> flowNodes = entry.getValue();
+                                        if (r.isBuilding()) {
+                                            runCount += pipelinesOnNode(node, r, flowNodes);
+                                        }
                                     }
                                 }
-                            }
-                            // This would mean that there are as many or more builds currently running than are allowed.
-                            if (runCount >= maxConcurrentPerNode) {
-                                return CauseOfBlockage.fromMessage(
-                                        Messages._ThrottleQueueTaskDispatcher_MaxCapacityOnNode(runCount));
+                                // This would mean that there are as many or more builds currently running than are allowed.
+                                if (runCount >= maxConcurrentPerNode) {
+                                    return CauseOfBlockage.fromMessage(
+                                            Messages._ThrottleQueueTaskDispatcher_MaxCapacityOnNode(runCount));
+                                }
                             }
                         }
                     }
@@ -261,49 +273,65 @@ public class ThrottleQueueTaskDispatcher extends QueueTaskDispatcher {
         for (String catNm : categories) {
             // Quick check that catNm itself is a real string.
             if (catNm != null && !catNm.equals("")) {
-                List<Task> categoryTasks = ThrottleJobProperty.getCategoryTasks(catNm);
+                // Synchronize on the category to prevent race conditions when multiple jobs
+                // are scheduled simultaneously for the same throttle category
+                synchronized (getCategoryLock(catNm)) {
+                    List<Task> categoryTasks = ThrottleJobProperty.getCategoryTasks(catNm);
 
-                ThrottleJobProperty.ThrottleCategory category =
-                        ThrottleJobProperty.fetchDescriptor().getCategoryByName(catNm);
+                    ThrottleJobProperty.ThrottleCategory category =
+                            ThrottleJobProperty.fetchDescriptor().getCategoryByName(catNm);
 
-                // Double check category itself isn't null
-                if (category != null) {
-                    if (category.getMaxConcurrentTotal() > 0) {
-                        int maxConcurrentTotal = category.getMaxConcurrentTotal();
-                        int totalRunCount = 0;
+                    // Double check category itself isn't null
+                    if (category != null) {
+                        if (category.getMaxConcurrentTotal() > 0) {
+                            int maxConcurrentTotal = category.getMaxConcurrentTotal();
+                            int totalRunCount = 0;
 
-                        for (Task catTask : categoryTasks) {
-                            if (jenkins.getQueue().isPending(catTask)) {
-                                return CauseOfBlockage.fromMessage(
-                                        Messages._ThrottleQueueTaskDispatcher_BuildPending());
+                            for (Task catTask : categoryTasks) {
+                                if (jenkins.getQueue().isPending(catTask)) {
+                                    return CauseOfBlockage.fromMessage(
+                                            Messages._ThrottleQueueTaskDispatcher_BuildPending());
+                                }
+                                totalRunCount += buildsOfProjectOnAllNodes(catTask);
                             }
-                            totalRunCount += buildsOfProjectOnAllNodes(catTask);
-                        }
-                        Map<String, List<FlowNode>> throttledPipelines =
-                                ThrottleJobProperty.getThrottledPipelineRunsForCategory(catNm);
-                        for (Map.Entry<String, List<FlowNode>> entry : throttledPipelines.entrySet()) {
-                            if (hasPendingPipelineForCategory(entry.getValue())) {
-                                return CauseOfBlockage.fromMessage(
-                                        Messages._ThrottleQueueTaskDispatcher_BuildPending());
-                            }
-                            Run<?, ?> r = Run.fromExternalizableId(entry.getKey());
-                            if (r != null) {
-                                List<FlowNode> flowNodes = entry.getValue();
-                                if (r.isBuilding()) {
-                                    totalRunCount += pipelinesOnAllNodes(r, flowNodes);
+                            Map<String, List<FlowNode>> throttledPipelines =
+                                    ThrottleJobProperty.getThrottledPipelineRunsForCategory(catNm);
+                            for (Map.Entry<String, List<FlowNode>> entry : throttledPipelines.entrySet()) {
+                                if (hasPendingPipelineForCategory(entry.getValue())) {
+                                    return CauseOfBlockage.fromMessage(
+                                            Messages._ThrottleQueueTaskDispatcher_BuildPending());
+                                }
+                                Run<?, ?> r = Run.fromExternalizableId(entry.getKey());
+                                if (r != null) {
+                                    List<FlowNode> flowNodes = entry.getValue();
+                                    if (r.isBuilding()) {
+                                        totalRunCount += pipelinesOnAllNodes(r, flowNodes);
+                                    }
                                 }
                             }
-                        }
 
-                        if (totalRunCount >= maxConcurrentTotal) {
-                            return CauseOfBlockage.fromMessage(
-                                    Messages._ThrottleQueueTaskDispatcher_MaxCapacityTotal(totalRunCount));
+                            if (totalRunCount >= maxConcurrentTotal) {
+                                return CauseOfBlockage.fromMessage(
+                                        Messages._ThrottleQueueTaskDispatcher_MaxCapacityTotal(totalRunCount));
+                            }
                         }
                     }
                 }
             }
         }
         return null;
+    }
+
+    /**
+     * Gets the synchronization object for the given category name.
+     * This ensures that all throttle checks for the same category are synchronized
+     * to prevent race conditions when multiple jobs are scheduled simultaneously.
+     *
+     * @param categoryName the name of the throttle category
+     * @return the synchronization object for the category
+     */
+    private static Object getCategoryLock(String categoryName) {
+        return categoryLocks.computeIfAbsent(categoryName, k -> new Object());
     }
 
     private boolean isAnotherBuildWithSameParametersRunningOnAnyNode(Queue.Item item) {

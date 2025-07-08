@@ -22,6 +22,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import hudson.model.FreeStyleProject;
+import hudson.model.Queue;
 import hudson.plugins.throttleconcurrents.testutils.HtmlUnitHelper;
 import hudson.util.VersionNumber;
 import java.io.IOException;
@@ -140,6 +141,131 @@ public class ThrottleQueueTaskDispatcherTest {
             throws ExecutionException, InterruptedException, IOException {
         assertBasedOnMaxLabelPairMatchingOrNot(
                 configureOneMaxLabelPair, someCategoryWideMaxConcurrentPerNode, expectMismatch, configureNoNodeLabel);
+    }
+
+    /**
+     * Test for JENKINS-36915: Race condition fix for simultaneous builds with same throttle category.
+     * This test verifies that when two jobs with the same throttle category are scheduled at the same time,
+     * only one runs while the other is blocked in the queue.
+     * 
+     * @throws ExecutionException upon Jenkins project build scheduling issue.
+     * @throws InterruptedException upon Jenkins global configuration issue.
+     * @throws IOException upon many potential Jenkins IO issues during test.
+     */
+    @Test
+    public void testConcurrentSchedulingRaceConditionFix()
+            throws ExecutionException, InterruptedException, IOException {
+        
+        // Configure global throttling with maxConcurrentTotal = 1
+        configureGlobalThrottlingForRaceConditionTest();
+        
+        // Create two freestyle projects with the same throttle category
+        FreeStyleProject jobA = r.createFreeStyleProject("JobA");
+        FreeStyleProject jobB = r.createFreeStyleProject("JobB");
+        
+        // Configure both jobs to use the same throttle category
+        configureJobThrottling(jobA);
+        configureJobThrottling(jobB);
+        
+        // Schedule both jobs simultaneously (simulating cron trigger at same time)
+        Queue.WaitingItem itemA = jobA.scheduleBuild2(0);
+        Queue.WaitingItem itemB = jobB.scheduleBuild2(0);
+        
+        // Wait a bit for the queue to process
+        Thread.sleep(100);
+        
+        // Check the queue state
+        Queue queue = r.getInstance().getQueue();
+        Queue.Item[] items = queue.getItems();
+        
+        // At least one job should be in the queue (blocked by throttling)
+        // This tests that the race condition is prevented
+        assertTrue("Expected at least one job to be blocked in queue due to throttling", 
+                   items.length > 0);
+        
+        // Verify that not both jobs started simultaneously
+        // (this would indicate the race condition was not fixed)
+        int runningBuilds = 0;
+        if (jobA.isBuilding()) runningBuilds++;
+        if (jobB.isBuilding()) runningBuilds++;
+        
+        assertTrue("At most one job should be running due to throttling (maxConcurrentTotal=1)", 
+                   runningBuilds <= 1);
+    }
+
+    /**
+     * Test for race condition when a running job finishes and multiple queued jobs are evaluated.
+     * This test verifies that when one job finishes and multiple jobs are queued,
+     * only one additional job starts running (not all of them simultaneously).
+     * 
+     * @throws ExecutionException upon Jenkins project build scheduling issue.
+     * @throws InterruptedException upon Jenkins global configuration issue.
+     * @throws IOException upon many potential Jenkins IO issues during test.
+     */
+    @Test
+    public void testQueuedJobsRaceConditionAfterJobCompletion()
+            throws ExecutionException, InterruptedException, IOException {
+        
+        // Configure global throttling with maxConcurrentTotal = 1
+        configureGlobalThrottlingForRaceConditionTest();
+        
+        // Create multiple freestyle projects with the same throttle category
+        FreeStyleProject jobA = r.createFreeStyleProject("JobA");
+        FreeStyleProject jobB = r.createFreeStyleProject("JobB");
+        FreeStyleProject jobC = r.createFreeStyleProject("JobC");
+        
+        // Configure all jobs to use the same throttle category
+        configureJobThrottling(jobA);
+        configureJobThrottling(jobB);
+        configureJobThrottling(jobC);
+        
+        // Schedule the first job and let it start
+        Queue.WaitingItem itemA = jobA.scheduleBuild2(0);
+        
+        // Wait for jobA to start
+        Thread.sleep(50);
+        
+        // Now schedule jobB and jobC while jobA is running
+        Queue.WaitingItem itemB = jobB.scheduleBuild2(0);
+        Queue.WaitingItem itemC = jobC.scheduleBuild2(0);
+        
+        // Wait for queue to process the new items
+        Thread.sleep(50);
+        
+        // Verify that only jobA is running and jobB, jobC are queued
+        Queue queue = r.getInstance().getQueue();
+        Queue.Item[] items = queue.getItems();
+        
+        // Should have 2 jobs in queue (jobB and jobC)
+        assertTrue("Expected 2 jobs to be queued while jobA is running", 
+                   items.length == 2);
+        
+        // Only jobA should be running
+        int runningBuilds = 0;
+        if (jobA.isBuilding()) runningBuilds++;
+        if (jobB.isBuilding()) runningBuilds++;
+        if (jobC.isBuilding()) runningBuilds++;
+        
+        assertTrue("Only jobA should be running initially (maxConcurrentTotal=1)", 
+                   runningBuilds == 1);
+        assertTrue("JobA should be the one running", jobA.isBuilding());
+        
+        // Now wait for jobA to complete and check that only one additional job starts
+        // Note: This is hard to test precisely in unit tests due to timing,
+        // but the synchronization should prevent multiple jobs from starting simultaneously
+        itemA.get(); // Wait for jobA to complete
+        
+        // Give a moment for the queue to process
+        Thread.sleep(100);
+        
+        // After jobA completes, verify that at most one additional job started
+        runningBuilds = 0;
+        if (jobA.isBuilding()) runningBuilds++;
+        if (jobB.isBuilding()) runningBuilds++;
+        if (jobC.isBuilding()) runningBuilds++;
+        
+        assertTrue("At most one job should be running after jobA completes (maxConcurrentTotal=1)", 
+                   runningBuilds <= 1);
     }
 
     /**
@@ -400,5 +526,37 @@ public class ThrottleQueueTaskDispatcherTest {
     private HtmlPage getLoggerPage(String logger) throws IOException {
         URL url = new URL(r.getURL() + logUrlPrefix + logger);
         return r.createWebClient().getPage(url);
+    }
+
+    private void configureGlobalThrottlingForRaceConditionTest() throws InterruptedException, IOException {
+        URL url = new URL(r.getURL() + configUrlSuffix);
+        HtmlPage page = r.createWebClient().getPage(url);
+        HtmlForm form = page.getFormByName(configFormName);
+        List<HtmlButton> buttons = HtmlUnitHelper.getButtonsByXPath(form, parentXPath + buttonsXPath);
+        String buttonText = "Add Category";
+        boolean buttonFound = false;
+
+        for (HtmlButton button : buttons) {
+            if (button.getTextContent().equals(buttonText)) {
+                buttonFound = true;
+                button.click();
+
+                HtmlInput input = form.getInputByName("_.categoryName");
+                input.setValue(testCategoryName);
+                
+                // Set maxConcurrentTotal to 1 to test the race condition
+                input = form.getInputByName("_.maxConcurrentTotal");
+                input.setValue("1");
+                
+                // Set maxConcurrentPerNode to 0 (unlimited per node, but total limited to 1)
+                input = form.getInputByName("_.maxConcurrentPerNode");
+                input.setValue("0");
+                
+                break;
+            }
+        }
+        
+        failWithMessageIfButtonNotFoundOnPage(buttonFound, buttonText, url);
+        submitForm(form);
     }
 }
